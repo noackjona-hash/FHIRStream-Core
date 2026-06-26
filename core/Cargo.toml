@@ -10,3 +10,6 @@ crossbeam-channel = "0.5"
 num_cpus = "1.16"
 rand = "0.8"
 chrono = "0.4"
+bumpalo = { version = "3.16", features = ["collections"] }
+core_affinity = "0.8"
+crossbeam-utils = "0.8"

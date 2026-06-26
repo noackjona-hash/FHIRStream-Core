@@ -1,6 +1,9 @@
 use serde::Serialize;
 use std::fmt;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use std::arch::x86_64::*;
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct FieldMetadata {
     pub address: usize,
@@ -26,34 +29,34 @@ impl<'a, T> ZeroCopyField<'a, T> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FhirHumanName<'a> {
+pub struct FhirHumanName<'bump, 'a> {
     pub family: Option<ZeroCopyField<'a, &'a str>>,
-    pub given: Vec<ZeroCopyField<'a, &'a str>>,
+    pub given: &'bump [ZeroCopyField<'a, &'a str>],
     pub metadata: FieldMetadata,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FhirPatient<'a> {
+pub struct FhirPatient<'bump, 'a> {
     pub resource_type: ZeroCopyField<'a, &'a str>,
     pub id: ZeroCopyField<'a, &'a str>,
     pub active: Option<ZeroCopyField<'a, bool>>,
     pub gender: Option<ZeroCopyField<'a, &'a str>>,
     pub birth_date: Option<ZeroCopyField<'a, &'a str>>,
-    pub names: Vec<FhirHumanName<'a>>,
+    pub names: &'bump [FhirHumanName<'bump, 'a>],
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct ParseError {
     pub code: u32,
-    pub message: String,
+    pub message: &'static str,
     pub offset: usize,
 }
 
 impl ParseError {
-    pub fn new(code: u32, message: impl Into<String>, offset: usize) -> Self {
+    pub fn new(code: u32, message: &'static str, offset: usize) -> Self {
         Self {
             code,
-            message: message.into(),
+            message,
             offset,
         }
     }
@@ -98,128 +101,246 @@ impl<'a> Token<'a> {
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn skip_whitespace_avx2(input: &[u8], mut cursor: usize) -> usize {
+    let len = input.len();
+    while cursor + 32 <= len {
+        // SAFETY: Pointer offset check guarantees bounds within 32-byte chunk.
+        let chunk = unsafe { _mm256_loadu_si256(input.as_ptr().add(cursor) as *const __m256i) };
+        let space = _mm256_set1_epi8(0x20);
+        let tab = _mm256_set1_epi8(0x09);
+        let lf = _mm256_set1_epi8(0x0A);
+        let cr = _mm256_set1_epi8(0x0D);
+        
+        let eq_space = _mm256_cmpeq_epi8(chunk, space);
+        let eq_tab = _mm256_cmpeq_epi8(chunk, tab);
+        let eq_lf = _mm256_cmpeq_epi8(chunk, lf);
+        let eq_cr = _mm256_cmpeq_epi8(chunk, cr);
+        
+        let is_ws = _mm256_or_si256(
+            _mm256_or_si256(eq_space, eq_tab),
+            _mm256_or_si256(eq_lf, eq_cr)
+        );
+        
+        let mask = _mm256_movemask_epi8(is_ws);
+        if mask != -1 {
+            let first_non_ws = (!mask).trailing_zeros() as usize;
+            return cursor + first_non_ws;
+        }
+        cursor += 32;
+    }
+    while cursor < len {
+        let b = input[cursor];
+        if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    cursor
+}
+
+#[inline(always)]
+fn skip_whitespace_fallback(input: &[u8], mut cursor: usize) -> usize {
+    let len = input.len();
+    while cursor < len {
+        let b = input[cursor];
+        if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    cursor
+}
+
+#[inline(always)]
+fn skip_whitespace_simd(input: &[u8], cursor: usize) -> usize {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: Checked CPU runtime compatibility before dispatching to AVX2 function.
+            return unsafe { skip_whitespace_avx2(input, cursor) };
+        }
+    }
+    skip_whitespace_fallback(input, cursor)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_string_avx2(input: &[u8], mut cursor: usize) -> (usize, bool) {
+    let len = input.len();
+    while cursor + 32 <= len {
+        // SAFETY: Pointer offset check guarantees bounds within 32-byte chunk.
+        let chunk = unsafe { _mm256_loadu_si256(input.as_ptr().add(cursor) as *const __m256i) };
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let backslash = _mm256_set1_epi8(b'\\' as i8);
+        
+        let eq_quote = _mm256_cmpeq_epi8(chunk, quote);
+        let eq_bs = _mm256_cmpeq_epi8(chunk, backslash);
+        
+        let matched = _mm256_or_si256(eq_quote, eq_bs);
+        let mask = _mm256_movemask_epi8(matched);
+        
+        if mask != 0 {
+            let first_match = mask.trailing_zeros() as usize;
+            let idx = cursor + first_match;
+            let is_backslash = input[idx] == b'\\';
+            return (idx, is_backslash);
+        }
+        cursor += 32;
+    }
+    while cursor < len {
+        let b = input[cursor];
+        if b == b'"' {
+            return (cursor, false);
+        } else if b == b'\\' {
+            return (cursor, true);
+        }
+        cursor += 1;
+    }
+    (len, false)
+}
+
+#[inline(always)]
+fn scan_string_fallback(input: &[u8], mut cursor: usize) -> (usize, bool) {
+    let len = input.len();
+    while cursor < len {
+        let b = input[cursor];
+        if b == b'"' {
+            return (cursor, false);
+        } else if b == b'\\' {
+            return (cursor, true);
+        }
+        cursor += 1;
+    }
+    (len, false)
+}
+
+#[inline(always)]
+fn scan_string_simd(input: &[u8], cursor: usize) -> (usize, bool) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: Checked CPU runtime compatibility before dispatching to AVX2 function.
+            return unsafe { scan_string_avx2(input, cursor) };
+        }
+    }
+    scan_string_fallback(input, cursor)
+}
+
 pub struct Lexer<'a> {
-    input: &'a str,
-    chars: std::str::CharIndices<'a>,
-    current_char: Option<(usize, char)>,
+    input: &'a [u8],
+    cursor: usize,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        let mut chars = input.char_indices();
-        let current_char = chars.next();
-        Self { input, chars, current_char }
-    }
-
-    fn bump(&mut self) {
-        self.current_char = self.chars.next();
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some((_, c)) = self.current_char {
-            if c.is_whitespace() {
-                self.bump();
-            } else {
-                break;
-            }
+        Self {
+            input: input.as_bytes(),
+            cursor: 0,
         }
     }
 
     pub fn next_token(&mut self) -> Result<Option<Token<'a>>, ParseError> {
-        self.skip_whitespace();
-        let (idx, c) = match self.current_char {
-            None => return Ok(None),
-            Some(x) => x,
-        };
+        self.cursor = skip_whitespace_simd(self.input, self.cursor);
+        if self.cursor >= self.input.len() {
+            return Ok(None);
+        }
+
+        let idx = self.cursor;
+        let c = self.input[idx];
+        self.cursor += 1;
 
         match c {
-            '{' => {
-                self.bump();
-                Ok(Some(Token::BraceOpen(idx)))
-            }
-            '}' => {
-                self.bump();
-                Ok(Some(Token::BraceClose(idx)))
-            }
-            '[' => {
-                self.bump();
-                Ok(Some(Token::BracketOpen(idx)))
-            }
-            ']' => {
-                self.bump();
-                Ok(Some(Token::BracketClose(idx)))
-            }
-            ':' => {
-                self.bump();
-                Ok(Some(Token::Colon(idx)))
-            }
-            ',' => {
-                self.bump();
-                Ok(Some(Token::Comma(idx)))
-            }
-            '"' => {
-                let start_idx = idx + 1;
-                self.bump();
+            b'{' => Ok(Some(Token::BraceOpen(idx))),
+            b'}' => Ok(Some(Token::BraceClose(idx))),
+            b'[' => Ok(Some(Token::BracketOpen(idx))),
+            b']' => Ok(Some(Token::BracketClose(idx))),
+            b':' => Ok(Some(Token::Colon(idx))),
+            b',' => Ok(Some(Token::Comma(idx))),
+            b'"' => {
+                let start_idx = self.cursor;
                 let mut escaped = false;
                 loop {
-                    match self.current_char {
-                        Some((end_idx, '"')) if !escaped => {
-                            self.bump();
-                            let slice = &self.input[start_idx..end_idx];
-                            return Ok(Some(Token::String(slice, start_idx - 1)));
+                    let (next_idx, is_backslash) = scan_string_simd(self.input, self.cursor);
+                    if next_idx >= self.input.len() {
+                        return Err(ParseError::new(401, "Unterminated string", idx));
+                    }
+                    if is_backslash {
+                        escaped = !escaped;
+                        self.cursor = next_idx + 1;
+                    } else {
+                        if escaped {
+                            let mut bs_count = 0;
+                            let mut temp = next_idx - 1;
+                            while temp >= start_idx && self.input[temp] == b'\\' {
+                                bs_count += 1;
+                                if temp == 0 {
+                                    break;
+                                }
+                                temp -= 1;
+                            }
+                            if bs_count % 2 == 1 {
+                                escaped = false;
+                                self.cursor = next_idx + 1;
+                                continue;
+                            }
                         }
-                        Some((_, '\\')) => {
-                            escaped = !escaped;
-                            self.bump();
-                        }
-                        Some(_) => {
-                            escaped = false;
-                            self.bump();
-                        }
-                        None => return Err(ParseError::new(401, "Unterminated string", idx)),
+                        
+                        self.cursor = next_idx + 1;
+                        // SAFETY: Validated token slice bounds directly from verified JSON structure.
+                        let slice = unsafe {
+                            std::str::from_utf8_unchecked(&self.input[start_idx..next_idx])
+                        };
+                        return Ok(Some(Token::String(slice, start_idx - 1)));
                     }
                 }
             }
-            't' | 'f' => {
+            b't' | b'f' => {
                 let start_idx = idx;
-                let is_true = c == 't';
-                let expected = if is_true { "true" } else { "false" };
-                for expected_char in expected.chars() {
-                    match self.current_char {
-                        Some((_, actual_char)) if actual_char == expected_char => {
-                            self.bump();
-                        }
-                        _ => return Err(ParseError::new(401, "Invalid boolean token", start_idx)),
-                    }
+                let is_true = c == b't';
+                let expected: &[u8] = if is_true { b"true" } else { b"false" };
+                
+                if start_idx + expected.len() <= self.input.len() && &self.input[start_idx..start_idx + expected.len()] == expected {
+                    self.cursor = start_idx + expected.len();
+                    // SAFETY: Validated token slice bounds directly from verified JSON structure.
+                    let slice = unsafe {
+                        std::str::from_utf8_unchecked(&self.input[start_idx..self.cursor])
+                    };
+                    Ok(Some(Token::Bool(is_true, slice, start_idx)))
+                } else {
+                    Err(ParseError::new(401, "Invalid boolean token", start_idx))
                 }
-                let slice = &self.input[start_idx..self.current_char.map_or(self.input.len(), |(i, _)| i)];
-                Ok(Some(Token::Bool(is_true, slice, start_idx)))
             }
-            'n' => {
+            b'n' => {
                 let start_idx = idx;
-                for expected_char in "null".chars() {
-                    match self.current_char {
-                        Some((_, actual_char)) if actual_char == expected_char => {
-                            self.bump();
-                        }
-                        _ => return Err(ParseError::new(401, "Invalid null token", start_idx)),
-                    }
+                if start_idx + 4 <= self.input.len() && &self.input[start_idx..start_idx + 4] == b"null" {
+                    self.cursor = start_idx + 4;
+                    // SAFETY: Validated token slice bounds directly from verified JSON structure.
+                    let slice = unsafe {
+                        std::str::from_utf8_unchecked(&self.input[start_idx..self.cursor])
+                    };
+                    Ok(Some(Token::Null(slice, start_idx)))
+                } else {
+                    Err(ParseError::new(401, "Invalid null token", start_idx))
                 }
-                let slice = &self.input[start_idx..self.current_char.map_or(self.input.len(), |(i, _)| i)];
-                Ok(Some(Token::Null(slice, start_idx)))
             }
-            '-' | '0'..='9' => {
+            b'-' | b'0'..=b'9' => {
                 let start_idx = idx;
-                self.bump();
-                while let Some((_, next_c)) = self.current_char {
-                    if next_c.is_ascii_digit() || next_c == '.' || next_c == 'e' || next_c == 'E' || next_c == '+' || next_c == '-' {
-                        self.bump();
+                while self.cursor < self.input.len() {
+                    let next_c = self.input[self.cursor];
+                    if next_c.is_ascii_digit() || next_c == b'.' || next_c == b'e' || next_c == b'E' || next_c == b'+' || next_c == b'-' {
+                        self.cursor += 1;
                     } else {
                         break;
                     }
                 }
-                let end_idx = self.current_char.map_or(self.input.len(), |(i, _)| i);
-                let slice = &self.input[start_idx..end_idx];
+                // SAFETY: Validated token slice bounds directly from verified JSON structure.
+                let slice = unsafe {
+                    std::str::from_utf8_unchecked(&self.input[start_idx..self.cursor])
+                };
                 Ok(Some(Token::Number(slice, start_idx)))
             }
             _ => Err(ParseError::new(401, "Unexpected character", idx)),
@@ -227,18 +348,20 @@ impl<'a> Lexer<'a> {
     }
 }
 
-pub struct FhirParser<'a> {
+pub struct FhirParser<'bump, 'a> {
     lexer: Lexer<'a>,
-    errors: Vec<ParseError>,
+    errors: bumpalo::collections::Vec<'bump, ParseError>,
     corrupt_bytes: usize,
+    bump: &'bump bumpalo::Bump,
 }
 
-impl<'a> FhirParser<'a> {
-    pub fn new(input: &'a str) -> Self {
+impl<'bump, 'a> FhirParser<'bump, 'a> {
+    pub fn new(input: &'a str, bump: &'bump bumpalo::Bump) -> Self {
         Self {
             lexer: Lexer::new(input),
-            errors: Vec::new(),
+            errors: bumpalo::collections::Vec::new_in(bump),
             corrupt_bytes: 0,
+            bump,
         }
     }
 
@@ -250,7 +373,7 @@ impl<'a> FhirParser<'a> {
         self.corrupt_bytes
     }
 
-    pub fn parse_patient(&mut self) -> Result<FhirPatient<'a>, ParseError> {
+    pub fn parse_patient(&mut self) -> Result<FhirPatient<'bump, 'a>, ParseError> {
         let root_token = self.lexer.next_token()?;
         match root_token {
             Some(Token::BraceOpen(_)) => {}
@@ -265,14 +388,14 @@ impl<'a> FhirParser<'a> {
         let mut active: Option<ZeroCopyField<'a, bool>> = None;
         let mut gender: Option<ZeroCopyField<'a, &'a str>> = None;
         let mut birth_date: Option<ZeroCopyField<'a, &'a str>> = None;
-        let mut names: Vec<FhirHumanName<'a>> = Vec::new();
+        let mut names: &'bump [FhirHumanName<'bump, 'a>] = &[];
 
         loop {
-            self.lexer.skip_whitespace();
+            self.lexer.cursor = skip_whitespace_simd(self.lexer.input, self.lexer.cursor);
             let tok = match self.lexer.next_token() {
                 Ok(t) => t,
                 Err(err) => {
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                     continue;
                 }
@@ -284,7 +407,7 @@ impl<'a> FhirParser<'a> {
                 Some(Token::String(k, o)) => (k, o),
                 Some(t) => {
                     let err = ParseError::new(401, "Expected key string inside object", t.offset());
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                     continue;
                 }
@@ -293,7 +416,7 @@ impl<'a> FhirParser<'a> {
             let colon_tok = match self.lexer.next_token() {
                 Ok(t) => t,
                 Err(err) => {
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                     continue;
                 }
@@ -304,13 +427,13 @@ impl<'a> FhirParser<'a> {
                 _ => {
                     let offset = colon_tok.map_or(self.lexer.input.len(), |t| t.offset());
                     let err = ParseError::new(401, "Expected ':' after key", offset);
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                     continue;
                 }
             }
 
-            let value_start_offset = self.lexer.current_char.map_or(self.lexer.input.len(), |(i, _)| i);
+            let value_start_offset = self.lexer.cursor;
 
             match key_token.0 {
                 "resourceType" => {
@@ -397,7 +520,7 @@ impl<'a> FhirParser<'a> {
             let next_tok = match self.lexer.next_token() {
                 Ok(t) => t,
                 Err(err) => {
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                     continue;
                 }
@@ -409,7 +532,7 @@ impl<'a> FhirParser<'a> {
                 _ => {
                     let offset = next_tok.map_or(self.lexer.input.len(), |t| t.offset());
                     let err = ParseError::new(401, "Expected ',' or '}' inside object", offset);
-                    self.errors.push(err.clone());
+                    self.errors.push(err);
                     self.raw_skip_to_next_field(err.offset);
                 }
             }
@@ -419,7 +542,7 @@ impl<'a> FhirParser<'a> {
             Some(r) => r,
             None => {
                 let err = ParseError::new(401, "Missing required field: resourceType", self.lexer.input.len());
-                self.errors.push(err.clone());
+                self.errors.push(err);
                 return Err(err);
             }
         };
@@ -428,7 +551,7 @@ impl<'a> FhirParser<'a> {
             Some(i) => i,
             None => {
                 let err = ParseError::new(401, "Missing required field: id", self.lexer.input.len());
-                self.errors.push(err.clone());
+                self.errors.push(err);
                 return Err(err);
             }
         };
@@ -446,7 +569,7 @@ impl<'a> FhirParser<'a> {
     fn parse_string_field(&mut self) -> Result<ZeroCopyField<'a, &'a str>, ParseError> {
         match self.lexer.next_token()? {
             Some(Token::String(s, _)) => {
-                // SAFETY: Casting reference to raw pointer to obtain memory address for UI highlight visualization.
+                // SAFETY: Pointer arithmetic relies on slice offset mapping inside self.lexer.input.
                 let address = s.as_ptr() as usize;
                 let offset = s.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
                 Ok(ZeroCopyField::new(s, address, offset))
@@ -459,7 +582,7 @@ impl<'a> FhirParser<'a> {
     fn parse_bool_field(&mut self) -> Result<ZeroCopyField<'a, bool>, ParseError> {
         match self.lexer.next_token()? {
             Some(Token::Bool(b, s, _)) => {
-                // SAFETY: Casting reference to raw pointer to obtain memory address for UI highlight visualization.
+                // SAFETY: Pointer arithmetic relies on slice offset mapping inside self.lexer.input.
                 let address = s.as_ptr() as usize;
                 let offset = s.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
                 Ok(ZeroCopyField::new(b, address, offset))
@@ -469,7 +592,7 @@ impl<'a> FhirParser<'a> {
         }
     }
 
-    fn parse_names_array(&mut self) -> Result<Vec<FhirHumanName<'a>>, ParseError> {
+    fn parse_names_array(&mut self) -> Result<&'bump [FhirHumanName<'bump, 'a>], ParseError> {
         let start_tok = self.lexer.next_token()?;
         match start_tok {
             Some(Token::BracketOpen(_)) => {}
@@ -479,9 +602,9 @@ impl<'a> FhirParser<'a> {
             }
         }
 
-        let mut names = Vec::new();
+        let mut names = bumpalo::collections::Vec::new_in(self.bump);
         loop {
-            self.lexer.skip_whitespace();
+            self.lexer.cursor = skip_whitespace_simd(self.lexer.input, self.lexer.cursor);
             let next_tok = self.lexer.next_token()?;
             match next_tok {
                 Some(Token::BracketClose(_)) => break,
@@ -506,15 +629,15 @@ impl<'a> FhirParser<'a> {
             }
         }
 
-        Ok(names)
+        Ok(names.into_bump_slice())
     }
 
-    fn parse_name_object(&mut self, start_offset: usize) -> Result<FhirHumanName<'a>, ParseError> {
+    fn parse_name_object(&mut self, start_offset: usize) -> Result<FhirHumanName<'bump, 'a>, ParseError> {
         let mut family: Option<ZeroCopyField<'a, &'a str>> = None;
-        let mut given: Vec<ZeroCopyField<'a, &'a str>> = Vec::new();
+        let mut given = bumpalo::collections::Vec::new_in(self.bump);
 
         loop {
-            self.lexer.skip_whitespace();
+            self.lexer.cursor = skip_whitespace_simd(self.lexer.input, self.lexer.cursor);
             let tok = self.lexer.next_token()?;
             let key = match tok {
                 Some(Token::String(k, _)) => k,
@@ -549,12 +672,12 @@ impl<'a> FhirParser<'a> {
                     }
 
                     loop {
-                        self.lexer.skip_whitespace();
+                        self.lexer.cursor = skip_whitespace_simd(self.lexer.input, self.lexer.cursor);
                         let next_element = self.lexer.next_token()?;
                         match next_element {
                             Some(Token::BracketClose(_)) => break,
                             Some(Token::String(s, _)) => {
-                                // SAFETY: Casting reference to raw pointer to obtain memory address for UI highlight visualization.
+                                // SAFETY: Pointer arithmetic relies on slice offset mapping inside self.lexer.input.
                                 let address = s.as_ptr() as usize;
                                 let offset = s.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
                                 given.push(ZeroCopyField::new(s, address, offset));
@@ -592,11 +715,11 @@ impl<'a> FhirParser<'a> {
             }
         }
 
-        // SAFETY: Obtaining the address of the parent struct start byte index in the JSON document block.
+        // SAFETY: Pointer offset mapping inside parent JSON memory segment.
         let raw_addr = unsafe { self.lexer.input.as_ptr().add(start_offset) as usize };
         Ok(FhirHumanName {
             family,
-            given,
+            given: given.into_bump_slice(),
             metadata: FieldMetadata {
                 address: raw_addr,
                 offset: start_offset,
@@ -636,28 +759,31 @@ impl<'a> FhirParser<'a> {
     }
 
     fn raw_skip_to_next_field(&mut self, start_offset: usize) {
-        let remaining = &self.lexer.input[self.lexer.current_char.map_or(self.lexer.input.len(), |(i, _)| i)..];
+        if self.lexer.cursor >= self.lexer.input.len() {
+            return;
+        }
+        let remaining = &self.lexer.input[self.lexer.cursor..];
         let mut brace_depth = 0;
         let mut bracket_depth = 0;
         let mut skipped_len = 0;
 
-        for (i, c) in remaining.char_indices() {
-            skipped_len = i + c.len_utf8();
-            match c {
-                '{' => brace_depth += 1,
-                '[' => bracket_depth += 1,
-                '}' => {
+        for (i, &b) in remaining.iter().enumerate() {
+            skipped_len = i + 1;
+            match b {
+                b'{' => brace_depth += 1,
+                b'[' => bracket_depth += 1,
+                b'}' => {
                     if brace_depth == 0 {
                         break;
                     }
                     brace_depth -= 1;
                 }
-                ']' => {
+                b']' => {
                     if bracket_depth > 0 {
                         bracket_depth -= 1;
                     }
                 }
-                ',' => {
+                b',' => {
                     if brace_depth == 0 && bracket_depth == 0 {
                         break;
                     }
@@ -666,10 +792,7 @@ impl<'a> FhirParser<'a> {
             }
         }
 
-        for _ in 0..skipped_len {
-            self.lexer.bump();
-        }
-
+        self.lexer.cursor += skipped_len;
         let end_offset = start_offset + skipped_len;
         self.corrupt_bytes += end_offset - start_offset;
     }
@@ -735,7 +858,8 @@ mod tests {
             ]
         }"#;
 
-        let mut parser = FhirParser::new(raw);
+        let bump = bumpalo::Bump::new();
+        let mut parser = FhirParser::new(raw, &bump);
         let patient = parser.parse_patient().unwrap();
 
         assert_eq!(patient.resource_type.value, "Patient");
@@ -763,7 +887,8 @@ mod tests {
             "gender": "female"
         }"#;
 
-        let mut parser = FhirParser::new(raw);
+        let bump = bumpalo::Bump::new();
+        let mut parser = FhirParser::new(raw, &bump);
         let patient = parser.parse_patient().unwrap();
 
         assert_eq!(patient.resource_type.value, "Patient");
@@ -785,7 +910,8 @@ mod tests {
             "gender": "other"
         }"#;
 
-        let mut parser = FhirParser::new(raw);
+        let bump = bumpalo::Bump::new();
+        let mut parser = FhirParser::new(raw, &bump);
         let patient = parser.parse_patient().unwrap();
 
         assert_eq!(patient.resource_type.value, "Patient");

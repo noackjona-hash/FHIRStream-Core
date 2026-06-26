@@ -90,7 +90,8 @@ pub async fn parse_single_handler(
     Json(payload): Json<ParseRequest>,
 ) -> impl IntoResponse {
     let raw = &payload.raw_json;
-    let mut parser = FhirParser::new(raw);
+    let bump = bumpalo::Bump::new();
+    let mut parser = FhirParser::new(raw, &bump);
     let patient = parser.parse_patient().ok();
     
     let errors = parser.get_errors().to_vec();
@@ -243,15 +244,20 @@ pub async fn stresstest_handler(
         let global_metrics = Arc::clone(&state.metrics);
 
         let handle = thread::spawn(move || {
+            let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
             while let Ok(record) = rx_clone.recv() {
                 let start = Instant::now();
                 let record_len = record.len() as u64;
-                let mut parser = FhirParser::new(&record);
-                let _parsed = parser.parse_patient();
                 
-                let duration = start.elapsed().as_micros() as u64;
-                let num_errors = parser.get_errors().len() as u64;
-                let corrupt = parser.get_corrupt_bytes() as u64;
+                let (duration, num_errors, corrupt) = {
+                    let mut parser = FhirParser::new(&record, &bump);
+                    let _parsed = parser.parse_patient();
+                    
+                    let duration = start.elapsed().as_micros() as u64;
+                    let num_errors = parser.get_errors().len() as u64;
+                    let corrupt = parser.get_corrupt_bytes() as u64;
+                    (duration, num_errors, corrupt)
+                };
 
                 success_clone.fetch_add(1, Ordering::Relaxed);
                 error_clone.fetch_add(num_errors, Ordering::Relaxed);
@@ -264,6 +270,8 @@ pub async fn stresstest_handler(
                 global_metrics.total_latency_us.fetch_add(duration, Ordering::Relaxed);
                 global_metrics.total_errors.fetch_add(num_errors, Ordering::Relaxed);
                 global_metrics.corrupt_bytes.fetch_add(corrupt, Ordering::Relaxed);
+                
+                bump.reset();
             }
         });
         workers.push(handle);

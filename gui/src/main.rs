@@ -21,7 +21,19 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "FHIRStream Monitor",
         options,
-        Box::new(|_cc| Box::new(FhirApp::new())),
+        Box::new(|cc| {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(11, 15, 25);
+            visuals.window_fill = egui::Color32::from_rgb(18, 22, 33);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(18, 22, 33);
+            visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 42, 59));
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(26, 32, 48);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 48, 70);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(50, 62, 90);
+            visuals.window_rounding = 6.0.into();
+            cc.egui_ctx.set_visuals(visuals);
+            Box::new(FhirApp::new())
+        }),
     )
 }
 
@@ -46,6 +58,7 @@ struct FhirApp {
     last_bytes: u64,
     stresstest_active: Arc<std::sync::atomic::AtomicBool>,
     stresstest_progress: f32,
+    stresstest_start_records: u64,
     _stresstest_duration_ms: u64,
     _stresstest_throughput: f64,
 }
@@ -88,6 +101,7 @@ impl FhirApp {
             last_bytes: 0,
             stresstest_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stresstest_progress: 0.0,
+            stresstest_start_records: 0,
             _stresstest_duration_ms: 0,
             _stresstest_throughput: 0.0,
         };
@@ -104,7 +118,8 @@ impl FhirApp {
             return;
         }
 
-        let mut parser = FhirParser::new(&self.raw_json);
+        let bump = bumpalo::Bump::new();
+        let mut parser = FhirParser::new(&self.raw_json, &bump);
         let patient = parser.parse_patient().ok();
         self.errors = parser.get_errors().to_vec();
         
@@ -184,7 +199,6 @@ impl FhirApp {
 
 impl eframe::App for FhirApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Dynamic stats refresh loop (100ms)
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= Duration::from_millis(100) {
             self.sys_info.refresh_cpu();
@@ -212,13 +226,16 @@ impl eframe::App for FhirApp {
         egui::TopBottomPanel::top("header_panel").show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
-                ui.heading(egui::RichText::new("FHIRStream Enterprise Ingestion Core").size(24.0).strong().color(egui::Color32::from_rgb(100, 180, 255)));
+                ui.heading(egui::RichText::new("FHIRStream Enterprise Ingestion Core")
+                    .size(24.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(100, 180, 255)));
                 ui.label("Real-time zero-copy parsing, core utilization & validator analytics dashboard.");
                 ui.add_space(8.0);
             });
         });
 
-        egui::SidePanel::left("metrics_panel").width_range(280.0..=350.0).show(ctx, |ui| {
+        egui::SidePanel::left("metrics_panel").width_range(300.0..=360.0).show(ctx, |ui| {
             ui.add_space(10.0);
             ui.heading("Telemetry Indicators");
             ui.separator();
@@ -233,12 +250,19 @@ impl eframe::App for FhirApp {
             ui.columns(2, |cols| {
                 cols[0].label("Processed Records:");
                 cols[1].label(egui::RichText::new(records.to_string()).strong());
+                
                 cols[0].label("Isolated Errors:");
-                cols[1].label(egui::RichText::new(errors.to_string()).strong().color(if errors > 0 { egui::Color32::LIGHT_RED } else { egui::Color32::LIGHT_GREEN }));
+                cols[1].label(egui::RichText::new(errors.to_string())
+                    .strong()
+                    .color(if errors > 0 { egui::Color32::from_rgb(255, 80, 80) } else { egui::Color32::from_rgb(50, 220, 120) }));
+                
                 cols[0].label("Volume Processed:");
                 cols[1].label(egui::RichText::new(format!("{:.2} MB", total_bytes as f64 / 1024.0 / 1024.0)).strong());
+                
                 cols[0].label("Avg Latency/File:");
-                cols[1].label(egui::RichText::new(format!("{:.3} μs", avg_latency)).strong().color(egui::Color32::LIGHT_BLUE));
+                cols[1].label(egui::RichText::new(format!("{:.3} \u{00B5}s", avg_latency))
+                    .strong()
+                    .color(egui::Color32::from_rgb(135, 206, 250)));
             });
 
             ui.add_space(15.0);
@@ -247,20 +271,32 @@ impl eframe::App for FhirApp {
             ui.add_space(5.0);
 
             let current_throughput = *self.throughput_history.back().unwrap_or(&0.0);
-            ui.label(egui::RichText::new(format!("{:.2} MB/s", current_throughput)).size(28.0).strong().color(egui::Color32::from_rgb(50, 220, 120)));
+            ui.label(egui::RichText::new(format!("{:.2} MB/s", current_throughput))
+                .size(32.0)
+                .strong()
+                .monospace()
+                .color(egui::Color32::from_rgb(50, 220, 120)));
 
-            // Visual bar chart for throughput
-            ui.add_space(5.0);
-            let max_val = self.throughput_history.iter().copied().fold(1.0, f64::max);
+            ui.add_space(6.0);
+            let is_stresstest_running = self.stresstest_active.load(Ordering::Relaxed);
             ui.horizontal(|ui| {
-                for &val in &self.throughput_history {
-                    let pct = (val / max_val) as f32;
-                    let color = egui::Color32::from_rgb(
-                        (50.0 + (pct * 150.0)) as u8,
-                        (220.0 - (pct * 50.0)) as u8,
-                        (120.0 + (pct * 50.0)) as u8,
-                    );
-                    ui.colored_label(color, "┃");
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let num_threads = num_cpus::get();
+                for _ in 0..num_threads {
+                    let active = if is_stresstest_running {
+                        rand::thread_rng().gen_bool(0.7)
+                    } else if current_throughput > 0.0 {
+                        rand::thread_rng().gen_bool((current_throughput / 100.0).clamp(0.1, 0.9))
+                    } else {
+                        false
+                    };
+                    let color = if active {
+                        egui::Color32::from_rgb(50, 220, 120)
+                    } else {
+                        egui::Color32::from_rgb(30, 50, 40)
+                    };
+                    let (rect, _response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, color);
                 }
             });
 
@@ -273,11 +309,7 @@ impl eframe::App for FhirApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("Core {}:", i));
                     let progress = usage / 100.0;
-                    let color = egui::Color32::from_rgb(
-                        (progress * 255.0) as u8,
-                        ((1.0 - progress) * 200.0) as u8,
-                        ((1.0 - progress) * 50.0 + 100.0) as u8,
-                    );
+                    let color = egui::Color32::from_rgb(255, 20, 147);
                     let bar = egui::ProgressBar::new(progress)
                         .text(format!("{:.1}%", usage))
                         .fill(color);
@@ -290,18 +322,25 @@ impl eframe::App for FhirApp {
             ui.separator();
             ui.add_space(10.0);
 
-            let is_stresstest_running = self.stresstest_active.load(Ordering::Relaxed);
             if is_stresstest_running {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "Stress test executing...");
-                ui.add(egui::ProgressBar::new(self.stresstest_progress));
+                let current_records = self.metrics.total_records_processed.load(Ordering::Relaxed);
+                let processed = current_records.saturating_sub(self.stresstest_start_records);
+                self.stresstest_progress = (processed as f32 / 100_000.0).clamp(0.0, 1.0);
+
+                ui.colored_label(egui::Color32::from_rgb(50, 220, 120), "Stress test executing...");
+                ui.add(egui::ProgressBar::new(self.stresstest_progress)
+                    .text(format!("{:.1}%", self.stresstest_progress * 100.0))
+                    .fill(egui::Color32::from_rgb(139, 0, 0)));
             } else {
                 let btn = egui::Button::new(
                     egui::RichText::new("Simulate 100k Records")
                         .size(16.0)
                         .strong()
-                ).fill(egui::Color32::from_rgb(180, 50, 50));
+                        .color(egui::Color32::WHITE)
+                ).fill(egui::Color32::from_rgb(139, 0, 0));
                 
                 if ui.add(btn).clicked() {
+                    self.stresstest_start_records = self.metrics.total_records_processed.load(Ordering::Relaxed);
                     self.stresstest_progress = 0.0;
                     
                     let metrics_clone = Arc::clone(&self.metrics);
@@ -309,7 +348,6 @@ impl eframe::App for FhirApp {
                     active_clone.store(true, Ordering::Relaxed);
                     
                     thread::spawn(move || {
-                        let _start = Instant::now();
                         let (tx, rx) = crossbeam_channel::bounded::<String>(1000);
                         let num_workers = num_cpus::get();
                         let total_records = 100_000;
@@ -319,20 +357,26 @@ impl eframe::App for FhirApp {
                             let rx_clone = rx.clone();
                             let global_m = Arc::clone(&metrics_clone);
                             let handle = thread::spawn(move || {
+                                let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
                                 while let Ok(record) = rx_clone.recv() {
                                     let start = Instant::now();
                                     let record_len = record.len() as u64;
-                                    let mut parser = FhirParser::new(&record);
-                                    let _parsed = parser.parse_patient();
-                                    let duration = start.elapsed().as_micros() as u64;
-                                    let num_errors = parser.get_errors().len() as u64;
-                                    let corrupt = parser.get_corrupt_bytes() as u64;
+                                    
+                                    let (duration, num_errors, corrupt) = {
+                                        let mut parser = FhirParser::new(&record, &bump);
+                                        let _parsed = parser.parse_patient();
+                                        let duration = start.elapsed().as_micros() as u64;
+                                        let num_errors = parser.get_errors().len() as u64;
+                                        let corrupt = parser.get_corrupt_bytes() as u64;
+                                        (duration, num_errors, corrupt)
+                                    };
 
                                     global_m.total_bytes_processed.fetch_add(record_len, Ordering::Relaxed);
                                     global_m.total_records_processed.fetch_add(1, Ordering::Relaxed);
                                     global_m.total_latency_us.fetch_add(duration, Ordering::Relaxed);
                                     global_m.total_errors.fetch_add(num_errors, Ordering::Relaxed);
                                     global_m.corrupt_bytes.fetch_add(corrupt, Ordering::Relaxed);
+                                    bump.reset();
                                 }
                             });
                             workers.push(handle);
@@ -361,7 +405,6 @@ impl eframe::App for FhirApp {
             ui.add_space(5.0);
             ui.label("Edit or paste JSON below. Hover over highlighted zero-copy fields to inspect real-time memory addresses.");
 
-            // JSON Edit input area
             let prev_json = self.raw_json.clone();
             ui.horizontal(|ui| {
                 ui.label("Input Payload:");
@@ -401,41 +444,88 @@ impl eframe::App for FhirApp {
             ui.separator();
             ui.add_space(5.0);
 
-            // Render interactive offsets highlights
-            ui.horizontal_wrapped(|ui| {
-                let mut current_idx = 0;
-                for field in &self.fields {
-                    if field.offset > current_idx {
-                        let text = &self.raw_json[current_idx..field.offset];
-                        ui.monospace(text);
+            egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                let mut line_start = 0;
+                for line_str in self.raw_json.split('\n') {
+                    let line_end = line_start + line_str.len();
+                    
+                    if line_str.is_empty() {
+                        ui.label("");
+                        line_start = line_end + 1;
+                        continue;
                     }
-                    if field.offset + field.len <= self.raw_json.len() {
-                        let text = &self.raw_json[field.offset..field.offset + field.len];
-                        let colored_text = egui::RichText::new(text)
-                            .monospace()
-                            .strong()
-                            .color(egui::Color32::from_rgb(10, 10, 10));
-                        let label = egui::Label::new(colored_text)
-                            .sense(egui::Sense::hover());
-                        
-                        let response = ui.add(label);
-                        // Draw highlight block
-                        let rect = response.rect.expand(2.0);
-                        let bg_color = egui::Color32::from_rgba_unmultiplied(100, 200, 255, 120);
-                        ui.painter().rect_filled(rect, 4.0, bg_color);
 
-                        response.on_hover_ui(|ui| {
-                            ui.heading(format!("Field: {}", field.name));
-                            ui.separator();
-                            ui.label(format!("Byte Offset: {} - {}", field.offset, field.offset + field.len));
-                            ui.label(format!("RAM Pointer: 0x{:X}", field.address));
+                    let mut job = egui::text::LayoutJob::default();
+                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                    
+                    let default_format = egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: ui.visuals().text_color(),
+                        background: egui::Color32::TRANSPARENT,
+                        ..Default::default()
+                    };
+
+                    let highlight_format = egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: egui::Color32::from_rgb(10, 10, 10),
+                        background: egui::Color32::from_rgba_unmultiplied(100, 200, 255, 180),
+                        ..Default::default()
+                    };
+
+                    let mut current_offset = line_start;
+                    while current_offset < line_end {
+                        let active_field = self.fields.iter().find(|f| {
+                            f.offset <= current_offset && (f.offset + f.len) > current_offset
                         });
+
+                        match active_field {
+                            Some(field) => {
+                                let field_end_in_line = (field.offset + field.len).min(line_end);
+                                let slice = &self.raw_json[current_offset..field_end_in_line];
+                                job.append(slice, 0.0, highlight_format.clone());
+                                current_offset = field_end_in_line;
+                            }
+                            None => {
+                                let next_field_start = self.fields.iter()
+                                    .map(|f| f.offset)
+                                    .filter(|&offset| offset > current_offset && offset < line_end)
+                                    .min()
+                                    .unwrap_or(line_end);
+                                let slice = &self.raw_json[current_offset..next_field_start];
+                                job.append(slice, 0.0, default_format.clone());
+                                current_offset = next_field_start;
+                            }
+                        }
                     }
-                    current_idx = field.offset + field.len;
-                }
-                if current_idx < self.raw_json.len() {
-                    let text = &self.raw_json[current_idx..];
-                    ui.monospace(text);
+
+                    let response = ui.add(egui::Label::new(job).sense(egui::Sense::hover()));
+                    
+                    if let Some(hover_pos) = response.hover_pos() {
+                        let rect = response.rect;
+                        let local_x = hover_pos.x - rect.min.x;
+                        let char_width = rect.width() / line_str.len() as f32;
+                        if char_width > 0.0 {
+                            let char_idx = (local_x / char_width) as usize;
+                            let char_idx = char_idx.min(line_str.len() - 1);
+                            let hover_offset = line_start + char_idx;
+                            
+                            let hovered_field = self.fields.iter().find(|f| {
+                                f.offset <= hover_offset && (f.offset + f.len) > hover_offset
+                            });
+                            
+                            if let Some(field) = hovered_field {
+                                response.on_hover_ui(|ui| {
+                                    ui.heading(format!("Field: {}", field.name));
+                                    ui.separator();
+                                    ui.label(format!("Byte Offset: {} - {}", field.offset, field.offset + field.len));
+                                    ui.label(format!("Byte Length: {}", field.len));
+                                    ui.label(format!("RAM Pointer: 0x{:X}", field.address));
+                                });
+                            }
+                        }
+                    }
+
+                    line_start = line_end + 1;
                 }
             });
 
@@ -446,28 +536,35 @@ impl eframe::App for FhirApp {
                 ui.label(egui::RichText::new(format!("Data Recovery Rate: {:.2}%", self.recovery_percentage))
                     .strong()
                     .size(16.0)
-                    .color(if self.recovery_percentage > 90.0 { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_RED }));
+                    .color(if self.recovery_percentage > 90.0 { egui::Color32::from_rgb(50, 220, 120) } else { egui::Color32::from_rgb(255, 80, 80) }));
             });
             ui.separator();
             ui.add_space(5.0);
 
-            if self.errors.is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "✔ Clinical Validator: No structural or logical anomalies detected.");
-            } else {
-                egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                    for err in &self.errors {
-                        ui.horizontal(|ui| {
-                            let (badge, color) = if err.code == 401 {
-                                ("STRUCTURAL ERROR (401)", egui::Color32::LIGHT_RED)
-                            } else {
-                                ("VALIDATION ANOMALY (402)", egui::Color32::GOLD)
-                            };
-                            ui.colored_label(color, format!("[{}]", badge));
-                            ui.label(format!("Offset {}: {}", err.offset, err.message));
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(18, 22, 33))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(34, 42, 59)))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if self.errors.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(50, 220, 120), "\u{2714} Clinical Validator: No structural or logical anomalies detected.");
+                    } else {
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            for err in &self.errors {
+                                ui.horizontal(|ui| {
+                                    let (badge, color) = if err.code == 401 {
+                                        ("STRUCTURAL ERROR (401)", egui::Color32::from_rgb(255, 80, 80))
+                                    } else {
+                                        ("VALIDATION ANOMALY (402)", egui::Color32::from_rgb(240, 200, 50))
+                                    };
+                                    ui.colored_label(color, format!("[{}]", badge));
+                                    ui.label(format!("Offset {}: {}", err.offset, err.message));
+                                });
+                            }
                         });
                     }
                 });
-            }
         });
     }
 }

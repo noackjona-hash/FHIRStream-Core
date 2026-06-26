@@ -19,3 +19,4 @@ rcgen = "0.13"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 crossbeam-channel = "0.5"
 num_cpus = "1.16"
+bumpalo = "3.16"
