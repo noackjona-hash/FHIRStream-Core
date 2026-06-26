@@ -1,0 +1,13 @@
+[package]
+name = "fhirstream_gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.26"
+fhirstream_core = { path = "../core" }
+sysinfo = "0.30"
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"

@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::thread;
+use std::borrow::Cow;
 use rand::Rng;
-use crate::parser::{FhirParser, FhirPatient, ParseError};
-use crate::pipeline::PipelineMetrics;
+use fhirstream_core::parser::{FhirParser, ParseError, FieldMetadata};
+use fhirstream_core::pipeline::PipelineMetrics;
+use fhirstream_core::mask::mask_phi_name;
 
 #[derive(Deserialize)]
 pub struct ParseRequest {
@@ -29,8 +31,31 @@ pub struct ErrorMatrixResponse {
 }
 
 #[derive(Serialize)]
+pub struct MaskedZeroCopyField<T> {
+    pub value: T,
+    pub metadata: FieldMetadata,
+}
+
+#[derive(Serialize)]
+pub struct MaskedFhirHumanName<'a> {
+    pub family: Option<MaskedZeroCopyField<Cow<'a, str>>>,
+    pub given: Vec<MaskedZeroCopyField<Cow<'a, str>>>,
+    pub metadata: FieldMetadata,
+}
+
+#[derive(Serialize)]
+pub struct MaskedFhirPatient<'a> {
+    pub resource_type: MaskedZeroCopyField<&'a str>,
+    pub id: MaskedZeroCopyField<&'a str>,
+    pub active: Option<MaskedZeroCopyField<bool>>,
+    pub gender: Option<MaskedZeroCopyField<&'a str>>,
+    pub birth_date: Option<MaskedZeroCopyField<&'a str>>,
+    pub names: Vec<MaskedFhirHumanName<'a>>,
+}
+
+#[derive(Serialize)]
 pub struct ParseResponse<'a> {
-    pub patient: Option<FhirPatient<'a>>,
+    pub patient: Option<MaskedFhirPatient<'a>>,
     pub error_matrix: ErrorMatrixResponse,
 }
 
@@ -47,18 +72,21 @@ pub struct StressTestResponse {
 
 pub struct ApiState {
     pub metrics: Arc<PipelineMetrics>,
+    pub mask_phi: bool,
 }
 
-pub fn create_router(metrics: Arc<PipelineMetrics>) -> Router {
-    let state = Arc::new(ApiState { metrics });
+pub fn create_router(metrics: Arc<PipelineMetrics>, mask_phi: bool) -> Router {
+    let state = Arc::new(ApiState { metrics, mask_phi });
     Router::new()
         .route("/api/v1/parse", post(parse_single_handler))
         .route("/api/v1/stresstest", get(stresstest_handler))
         .route("/api/v1/metrics", get(ws_handler))
+        .route("/metrics", get(prometheus_metrics_handler))
         .with_state(state)
 }
 
 pub async fn parse_single_handler(
+    State(state): State<Arc<ApiState>>,
     Json(payload): Json<ParseRequest>,
 ) -> impl IntoResponse {
     let raw = &payload.raw_json;
@@ -75,8 +103,66 @@ pub async fn parse_single_handler(
         100.0
     };
 
+    let masked_patient = patient.map(|p| {
+        let masked_names = p.names.iter().map(|name| {
+            let family = name.family.as_ref().map(|f| {
+                let value = if state.mask_phi {
+                    mask_phi_name(f.value)
+                } else {
+                    Cow::Borrowed(f.value)
+                };
+                MaskedZeroCopyField {
+                    value,
+                    metadata: f.metadata,
+                }
+            });
+
+            let given = name.given.iter().map(|g| {
+                let value = if state.mask_phi {
+                    mask_phi_name(g.value)
+                } else {
+                    Cow::Borrowed(g.value)
+                };
+                MaskedZeroCopyField {
+                    value,
+                    metadata: g.metadata,
+                }
+            }).collect();
+
+            MaskedFhirHumanName {
+                family,
+                given,
+                metadata: name.metadata,
+            }
+        }).collect();
+
+        MaskedFhirPatient {
+            resource_type: MaskedZeroCopyField {
+                value: p.resource_type.value,
+                metadata: p.resource_type.metadata,
+            },
+            id: MaskedZeroCopyField {
+                value: p.id.value,
+                metadata: p.id.metadata,
+            },
+            active: p.active.map(|a| MaskedZeroCopyField {
+                value: a.value,
+                metadata: a.metadata,
+            }),
+            gender: p.gender.map(|g| MaskedZeroCopyField {
+                value: g.value,
+                metadata: g.metadata,
+            }),
+            birth_date: p.birth_date.map(|b| MaskedZeroCopyField {
+                value: b.value,
+                metadata: b.metadata,
+            }),
+            names: masked_names,
+        }
+    });
+
     let response_data = ParseResponse {
-        patient,
+        patient: masked_patient,
         error_matrix: ErrorMatrixResponse {
             errors,
             success_percentage,
@@ -95,6 +181,41 @@ pub async fn parse_single_handler(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         serialized,
     ).into_response()
+}
+
+pub async fn prometheus_metrics_handler(
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    let bytes = state.metrics.total_bytes_processed.load(Ordering::Relaxed);
+    let records = state.metrics.total_records_processed.load(Ordering::Relaxed);
+    let latency = state.metrics.total_latency_us.load(Ordering::Relaxed);
+    let errors = state.metrics.total_errors.load(Ordering::Relaxed);
+    let corrupt = state.metrics.corrupt_bytes.load(Ordering::Relaxed);
+
+    let output = format!(
+        r#"# HELP fhirstream_bytes_processed_total Total bytes processed by the ingestion engine
+# TYPE fhirstream_bytes_processed_total counter
+fhirstream_bytes_processed_total {}
+# HELP fhirstream_records_processed_total Total FHIR patient records processed
+# TYPE fhirstream_records_processed_total counter
+fhirstream_records_processed_total {}
+# HELP fhirstream_latency_us_total Cumulative processing latency in microseconds
+# TYPE fhirstream_latency_us_total counter
+fhirstream_latency_us_total {}
+# HELP fhirstream_errors_total Total parsing/validation errors encountered
+# TYPE fhirstream_errors_total counter
+fhirstream_errors_total {}
+# HELP fhirstream_corrupt_bytes_total Total corrupt bytes isolated and recovered
+# TYPE fhirstream_corrupt_bytes_total counter
+fhirstream_corrupt_bytes_total {}
+"#,
+        bytes, records, latency, errors, corrupt
+    );
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        output,
+    )
 }
 
 pub async fn stresstest_handler(
