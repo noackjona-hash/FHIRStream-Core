@@ -245,6 +245,12 @@ pub async fn stresstest_handler(
 
         let handle = thread::spawn(move || {
             let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
+            let mut local_success = 0;
+            let mut local_errors = 0;
+            let mut local_bytes = 0;
+            let mut local_corrupt = 0;
+            let mut local_latency = 0;
+
             while let Ok(record) = rx_clone.recv() {
                 let start = Instant::now();
                 let record_len = record.len() as u64;
@@ -259,19 +265,47 @@ pub async fn stresstest_handler(
                     (duration, num_errors, corrupt)
                 };
 
-                success_clone.fetch_add(1, Ordering::Relaxed);
-                error_clone.fetch_add(num_errors, Ordering::Relaxed);
-                bytes_clone.fetch_add(record_len, Ordering::Relaxed);
-                corrupt_clone.fetch_add(corrupt, Ordering::Relaxed);
-                latency_clone.fetch_add(duration, Ordering::Relaxed);
+                local_success += 1;
+                local_errors += num_errors;
+                local_bytes += record_len;
+                local_corrupt += corrupt;
+                local_latency += duration;
 
-                global_metrics.total_bytes_processed.fetch_add(record_len, Ordering::Relaxed);
-                global_metrics.total_records_processed.fetch_add(1, Ordering::Relaxed);
-                global_metrics.total_latency_us.fetch_add(duration, Ordering::Relaxed);
-                global_metrics.total_errors.fetch_add(num_errors, Ordering::Relaxed);
-                global_metrics.corrupt_bytes.fetch_add(corrupt, Ordering::Relaxed);
+                if local_success >= 256 {
+                    success_clone.fetch_add(local_success, Ordering::Relaxed);
+                    error_clone.fetch_add(local_errors, Ordering::Relaxed);
+                    bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+                    corrupt_clone.fetch_add(local_corrupt, Ordering::Relaxed);
+                    latency_clone.fetch_add(local_latency, Ordering::Relaxed);
+
+                    global_metrics.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                    global_metrics.total_records_processed.fetch_add(local_success, Ordering::Relaxed);
+                    global_metrics.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                    global_metrics.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                    global_metrics.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
+
+                    local_success = 0;
+                    local_errors = 0;
+                    local_bytes = 0;
+                    local_corrupt = 0;
+                    local_latency = 0;
+                }
                 
                 bump.reset();
+            }
+
+            if local_success > 0 {
+                success_clone.fetch_add(local_success, Ordering::Relaxed);
+                error_clone.fetch_add(local_errors, Ordering::Relaxed);
+                bytes_clone.fetch_add(local_bytes, Ordering::Relaxed);
+                corrupt_clone.fetch_add(local_corrupt, Ordering::Relaxed);
+                latency_clone.fetch_add(local_latency, Ordering::Relaxed);
+
+                global_metrics.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                global_metrics.total_records_processed.fetch_add(local_success, Ordering::Relaxed);
+                global_metrics.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                global_metrics.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                global_metrics.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
             }
         });
         workers.push(handle);

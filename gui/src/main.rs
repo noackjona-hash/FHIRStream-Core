@@ -279,8 +279,9 @@ impl eframe::App for FhirApp {
 
             ui.add_space(6.0);
             let is_stresstest_running = self.stresstest_active.load(Ordering::Relaxed);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
                 let num_threads = num_cpus::get();
                 for _ in 0..num_threads {
                     let active = if is_stresstest_running {
@@ -305,17 +306,21 @@ impl eframe::App for FhirApp {
             ui.separator();
             ui.add_space(5.0);
 
-            for (i, &usage) in self.cpu_usages.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Core {}:", i));
-                    let progress = usage / 100.0;
-                    let color = egui::Color32::from_rgb(255, 20, 147);
-                    let bar = egui::ProgressBar::new(progress)
-                        .text(format!("{:.1}%", usage))
-                        .fill(color);
-                    ui.add(bar);
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for (i, &usage) in self.cpu_usages.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Core {:>2}:", i));
+                            let progress = usage / 100.0;
+                            let color = egui::Color32::from_rgb(255, 20, 147);
+                            let bar = egui::ProgressBar::new(progress)
+                                .text(format!("{:.1}%", usage))
+                                .fill(color);
+                            ui.add(bar);
+                        });
+                    }
                 });
-            }
 
             ui.add_space(20.0);
             ui.heading("Stress Testing");
@@ -358,6 +363,12 @@ impl eframe::App for FhirApp {
                             let global_m = Arc::clone(&metrics_clone);
                             let handle = thread::spawn(move || {
                                 let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
+                                let mut local_bytes = 0;
+                                let mut local_records = 0;
+                                let mut local_latency = 0;
+                                let mut local_errors = 0;
+                                let mut local_corrupt = 0;
+
                                 while let Ok(record) = rx_clone.recv() {
                                     let start = Instant::now();
                                     let record_len = record.len() as u64;
@@ -371,12 +382,34 @@ impl eframe::App for FhirApp {
                                         (duration, num_errors, corrupt)
                                     };
 
-                                    global_m.total_bytes_processed.fetch_add(record_len, Ordering::Relaxed);
-                                    global_m.total_records_processed.fetch_add(1, Ordering::Relaxed);
-                                    global_m.total_latency_us.fetch_add(duration, Ordering::Relaxed);
-                                    global_m.total_errors.fetch_add(num_errors, Ordering::Relaxed);
-                                    global_m.corrupt_bytes.fetch_add(corrupt, Ordering::Relaxed);
+                                    local_bytes += record_len;
+                                    local_records += 1;
+                                    local_latency += duration;
+                                    local_errors += num_errors;
+                                    local_corrupt += corrupt;
+
+                                    if local_records >= 256 {
+                                        global_m.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                                        global_m.total_records_processed.fetch_add(local_records, Ordering::Relaxed);
+                                        global_m.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                                        global_m.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                                        global_m.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
+
+                                        local_bytes = 0;
+                                        local_records = 0;
+                                        local_latency = 0;
+                                        local_errors = 0;
+                                        local_corrupt = 0;
+                                    }
                                     bump.reset();
+                                }
+
+                                if local_records > 0 {
+                                    global_m.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                                    global_m.total_records_processed.fetch_add(local_records, Ordering::Relaxed);
+                                    global_m.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                                    global_m.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                                    global_m.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
                                 }
                             });
                             workers.push(handle);

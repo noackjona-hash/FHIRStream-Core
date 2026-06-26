@@ -143,18 +143,25 @@ impl<T, const N: usize> RingBuffer<T, N> {
 }
 
 pub struct IngestionPipeline {
-    queue: Arc<RingBuffer<String, 2048>>,
+    queues: Vec<Arc<RingBuffer<String, 2048>>>,
+    write_selector: AtomicU64,
     _metrics: Arc<PipelineMetrics>,
 }
 
 impl IngestionPipeline {
     pub fn new(metrics: Arc<PipelineMetrics>) -> Self {
-        let queue = Arc::new(RingBuffer::<String, 2048>::new());
         let num_workers = num_cpus::get();
+        let num_queues = (num_workers / 8).clamp(4, 8);
+        
+        let mut queues = Vec::with_capacity(num_queues);
+        for _ in 0..num_queues {
+            queues.push(Arc::new(RingBuffer::<String, 2048>::new()));
+        }
+
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
         for i in 0..num_workers {
-            let q_clone = Arc::clone(&queue);
+            let q_clone = Arc::clone(&queues[i % num_queues]);
             let m = Arc::clone(&metrics);
             let core_id = core_ids.get(i % core_ids.len()).copied();
             
@@ -164,37 +171,78 @@ impl IngestionPipeline {
                 }
                 
                 let mut bump = bumpalo::Bump::with_capacity(512 * 1024);
+                let mut local_bytes = 0u64;
+                let mut local_records = 0u64;
+                let mut local_latency = 0u64;
+                let mut local_errors = 0u64;
+                let mut local_corrupt = 0u64;
+
                 loop {
-                    let record = q_clone.pop_blocking();
-                    let start = Instant::now();
-                    let record_len = record.len() as u64;
+                    if let Some(record) = q_clone.pop() {
+                        let start = Instant::now();
+                        let record_len = record.len() as u64;
 
-                    let (duration, num_errors, corrupt) = {
-                        let mut parser = FhirParser::new(&record, &bump);
-                        let _parsed = parser.parse_patient();
-                        
-                        let duration = start.elapsed().as_micros() as u64;
-                        let num_errors = parser.get_errors().len() as u64;
-                        let corrupt = parser.get_corrupt_bytes() as u64;
-                        (duration, num_errors, corrupt)
-                    };
+                        let (duration, num_errors, corrupt) = {
+                            let mut parser = FhirParser::new(&record, &bump);
+                            let _parsed = parser.parse_patient();
+                            
+                            let duration = start.elapsed().as_micros() as u64;
+                            let num_errors = parser.get_errors().len() as u64;
+                            let corrupt = parser.get_corrupt_bytes() as u64;
+                            (duration, num_errors, corrupt)
+                        };
 
-                    m.total_bytes_processed.fetch_add(record_len, Ordering::Relaxed);
-                    m.total_records_processed.fetch_add(1, Ordering::Relaxed);
-                    m.total_latency_us.fetch_add(duration, Ordering::Relaxed);
-                    m.total_errors.fetch_add(num_errors, Ordering::Relaxed);
-                    m.corrupt_bytes.fetch_add(corrupt, Ordering::Relaxed);
-                    
-                    bump.reset();
-                    std::thread::yield_now();
+                        local_bytes += record_len;
+                        local_records += 1;
+                        local_latency += duration;
+                        local_errors += num_errors;
+                        local_corrupt += corrupt;
+
+                        if local_records >= 256 {
+                            m.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                            m.total_records_processed.fetch_add(local_records, Ordering::Relaxed);
+                            m.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                            m.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                            m.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
+                            
+                            local_bytes = 0;
+                            local_records = 0;
+                            local_latency = 0;
+                            local_errors = 0;
+                            local_corrupt = 0;
+                        }
+
+                        bump.reset();
+                    } else {
+                        if local_records > 0 {
+                            m.total_bytes_processed.fetch_add(local_bytes, Ordering::Relaxed);
+                            m.total_records_processed.fetch_add(local_records, Ordering::Relaxed);
+                            m.total_latency_us.fetch_add(local_latency, Ordering::Relaxed);
+                            m.total_errors.fetch_add(local_errors, Ordering::Relaxed);
+                            m.corrupt_bytes.fetch_add(local_corrupt, Ordering::Relaxed);
+                            
+                            local_bytes = 0;
+                            local_records = 0;
+                            local_latency = 0;
+                            local_errors = 0;
+                            local_corrupt = 0;
+                        }
+                        std::thread::yield_now();
+                    }
                 }
             });
         }
 
-        Self { queue, _metrics: metrics }
+        Self {
+            queues,
+            write_selector: AtomicU64::new(0),
+            _metrics: metrics,
+        }
     }
 
     pub fn submit(&self, record: String) {
-        self.queue.push_blocking(record);
+        let idx = self.write_selector.fetch_add(1, Ordering::Relaxed) as usize;
+        let queue_idx = idx % self.queues.len();
+        self.queues[queue_idx].push_blocking(record);
     }
 }
